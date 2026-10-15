@@ -1,0 +1,584 @@
+/*
+Copyright 2022 Adobe. All rights reserved.
+This file is licensed to you under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License. You may obtain a copy
+of the License at http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under
+the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR REPRESENTATIONS
+OF ANY KIND, either express or implied. See the License for the specific language
+governing permissions and limitations under the License.
+*/
+
+/**
+ * MCP Server for Adobe I/O Runtime - With MCP SDK Implementation
+ *
+ * Following the exact pattern from TypeScript SDK examples but adapted for Adobe I/O Runtime.
+ * Uses the stateless pattern where fresh server and transport instances are created per request.
+ */
+
+// Must run before @modelcontextprotocol/sdk imports (SDK 1.24+ uses global File at load time).
+require('./node18-web-globals.js')
+
+const aioLogger = require('@adobe/aio-lib-core-logging')
+const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js')
+const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js')
+const { registerTools, registerResources, registerPrompts } = require('./tools.js')
+const { validateRequestAuth } = require('./validator.js')
+
+// SDK 1.24+ uses Web Standard transport. Optional module (see webpack externals) so build succeeds on 1.17.4.
+// undefined = not yet loaded; null = load failed or unavailable; otherwise the transport class.
+let _webStandardTransport
+function getWebStandardTransport () {
+ if (_webStandardTransport !== undefined) return _webStandardTransport
+ try {
+  const web = require('@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js')
+  _webStandardTransport = web.WebStandardStreamableHTTPServerTransport
+ } catch (_) {
+  _webStandardTransport = null
+ }
+ return _webStandardTransport
+}
+
+// Global logger variable
+let logger = null
+
+/**
+ * Create MCP server instance with all capabilities
+ * Following the exact pattern from SDK examples
+ */
+function createMcpServer (params) {
+    const server = new McpServer({
+    name: 'prism-mcp-server',
+        version: '1.0.0'
+    }, {
+        capabilities: {
+            logging: {},
+            tools: {},
+            resources: {},
+            prompts: {}
+        }
+    })
+
+    // Register all capabilities
+    registerTools(server, params)
+    registerResources(server)
+    registerPrompts(server)
+
+    if (logger) {
+        logger.info('MCP Server created with tools, resources, prompts, and logging capabilities')
+    }
+
+    return server
+}
+
+/**
+ * Parse request body from Adobe I/O Runtime parameters
+ */
+function parseRequestBody (params) {
+    if (!params.__ow_body) {
+        return null
+    }
+
+    try {
+        if (typeof params.__ow_body === 'string') {
+            // Try base64 decode first, then direct parse
+            try {
+                const decoded = Buffer.from(params.__ow_body, 'base64').toString('utf8')
+                return JSON.parse(decoded)
+            } catch (e) {
+                return JSON.parse(params.__ow_body)
+            }
+        } else {
+            return params.__ow_body
+        }
+    } catch (error) {
+        logger?.error('Failed to parse request body:', error)
+        throw new Error(`Failed to parse request body: ${error.message}`)
+    }
+}
+
+/**
+ * Normalize headers to lowercase keys for consistent lookup
+ */
+function normalizeHeaders (headers) {
+    const normalized = {}
+    if (headers) {
+        for (const key in headers) {
+            normalized[key.toLowerCase()] = headers[key]
+        }
+    }
+    return normalized
+}
+
+/**
+ * Create a Web Standard Request from Adobe I/O params (for SDK 1.24+ WebStandardStreamableHTTPServerTransport)
+*/
+function createWebRequest (params) {
+    const body = parseRequestBody(params)
+    const incomingHeaders = normalizeHeaders(params.__ow_headers)
+    const method = (params.__ow_method || 'POST').toUpperCase()
+    const path = params.__ow_path || '/mcp-server'
+    const url = `https://runtime.adobe.io${path}`
+    const headers = new Headers(incomingHeaders)
+    // SDK 1.24+ requires both; set after incoming so client cannot override
+    headers.set('content-type', 'application/json')
+    headers.set('accept', 'application/json, text/event-stream')
+    const mcpSessionId = params['mcp-session-id'] || incomingHeaders['mcp-session-id']
+    if (mcpSessionId) headers.set('mcp-session-id', mcpSessionId)
+    const init = { method, headers }
+    if (body != null && method === 'POST') {
+      init.body = typeof body === 'string' ? body : JSON.stringify(body)
+    }
+    return new Request(url, init)
+}
+/**
+ * Convert Web Standard Response to Adobe I/O Runtime return shape { statusCode, headers, body }
+ */
+async function responseToRuntime (response) {
+const headers = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
+    'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization, x-api-key, mcp-session-id, Last-Event-ID',
+    'Access-Control-Expose-Headers': 'Content-Type, mcp-session-id, Last-Event-ID',
+    'Access-Control-Max-Age': '86400'
+}
+response.headers.forEach((value, key) => {
+    headers[key] = value
+})
+const body = await response.text()
+return { statusCode: response.status, headers, body }
+}
+/**
+ * Create minimal req object compatible with StreamableHTTPServerTransport (SDK 1.17.x)
+ */
+function createCompatibleRequest (params) {
+    const body = parseRequestBody(params)
+
+    // Normalize incoming headers to lowercase keys
+    const incomingHeaders = normalizeHeaders(params.__ow_headers)
+
+    // Log if client requested SSE (for debugging)
+    if (incomingHeaders.accept && incomingHeaders.accept.includes('text/event-stream')) {
+        logger?.info('Client requested SSE streaming, forcing JSON mode (serverless limitation)')
+    }
+
+    // Build headers with lowercase keys
+    // SDK requires Accept header to include both application/json AND text/event-stream
+    const headers = {
+        'content-type': 'application/json',
+        'mcp-session-id': params['mcp-session-id'] || incomingHeaders['mcp-session-id'],
+        ...incomingHeaders,
+        // SDK requires both content types - it will use enableJsonResponse to pick JSON mode
+        'accept': 'application/json, text/event-stream'
+    }
+
+    return {
+        method: (params.__ow_method || 'GET').toUpperCase(),
+        url: params.__ow_path || '/mcp-server',
+        path: params.__ow_path || '/mcp-server',
+        headers,
+        body,
+        // Socket mock for streaming checks
+        socket: {
+            remoteAddress: '127.0.0.1',
+            encrypted: true
+        },
+        get (name) {
+            return this.headers[name.toLowerCase()]
+        }
+    }
+}
+
+/**
+ * Create minimal res object compatible with StreamableHTTPServerTransport
+ */
+function createCompatibleResponse () {
+    let statusCode = 200
+    let headers = {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
+        'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization, x-api-key, mcp-session-id, Last-Event-ID',
+        'Access-Control-Expose-Headers': 'Content-Type, mcp-session-id, Last-Event-ID',
+        'Access-Control-Max-Age': '86400'
+    }
+    let body = ''
+    let headersSent = false
+
+    const res = {
+        // Status and headers
+        status: code => { 
+            statusCode = code
+            res.statusCode = code
+            return res 
+        },
+        setHeader: (name, value) => { headers[name] = value; return res },
+        getHeader: name => headers[name],
+        writeHead: (code, reasonOrHeaders, headerObj) => {
+            statusCode = code
+            res.statusCode = code
+            // Handle both writeHead(code, headers) and writeHead(code, reason, headers)
+            const hdrs = typeof reasonOrHeaders === 'object' ? reasonOrHeaders : (headerObj || {})
+            headers = { ...headers, ...hdrs }
+            headersSent = true
+            return res
+        },
+
+        // Writing response
+        write: chunk => {
+            if (chunk) {
+                body += typeof chunk === 'string' ? chunk : JSON.stringify(chunk)
+            }
+            return true
+        },
+        end: chunk => {
+            if (chunk) {
+                body += typeof chunk === 'string' ? chunk : JSON.stringify(chunk)
+            }
+            headersSent = true
+            return res
+        },
+        json: obj => {
+            headers['Content-Type'] = 'application/json'
+            body = JSON.stringify(obj)
+            headersSent = true
+            return res
+        },
+        send: data => {
+            if (data) {
+                body = typeof data === 'string' ? data : JSON.stringify(data)
+            }
+            headersSent = true
+            return res
+        },
+
+        // Properties
+        get headersSent () { return headersSent },
+        get writableEnded () { return false },
+        get writableFinished () { return false },
+        get finished () { return false },
+        get writable () { return true },
+        statusCode: 200,
+        
+        // Socket mock (needed for streaming checks)
+        socket: {
+            writable: true,
+            destroyed: false,
+            on: () => {},
+            once: () => {},
+            removeListener: () => {},
+            write: () => true,
+            end: () => {}
+        },
+        connection: null,
+        
+        // Flush method
+        flushHeaders: () => { headersSent = true },
+
+        // Event emitter (minimal implementation)
+        on: (event, handler) => { return res },
+        once: (event, handler) => { return res },
+        emit: (event, ...args) => { return true },
+        removeListener: () => { return res },
+        addListener: (event, handler) => { return res },
+        off: (event, handler) => { return res },
+
+        // Get result for Adobe I/O Runtime
+        getResult: () => {
+            logger?.info('Final response - Status:', statusCode, 'Body length:', body.length, 'Headers:', Object.keys(headers).join(', '))
+            return { statusCode, headers, body }
+        }
+    }
+
+    return res
+}
+
+/**
+ * Handle health check requests
+ */
+function handleHealthCheck () {
+    return {
+        statusCode: 200,
+        headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
+            'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization, x-api-key, mcp-session-id, Last-Event-ID',
+            'Access-Control-Expose-Headers': 'Content-Type, mcp-session-id, Last-Event-ID',
+            'Access-Control-Max-Age': '86400',
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            status: 'healthy',
+            server: 'prism-mcp-server',
+            version: '1.0.0',
+            description: 'Adobe I/O Runtime MCP Server using official TypeScript SDK MCP v1.24.x',
+            timestamp: new Date().toISOString(),
+            transport: 'StreamableHTTP',
+            sdk: '@modelcontextprotocol/sdk'
+        })
+    }
+}
+
+/**
+ * Handle CORS OPTIONS requests
+ */
+function handleOptionsRequest () {
+    return {
+        statusCode: 200,
+        headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
+            'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization, x-api-key, mcp-session-id, Last-Event-ID',
+            'Access-Control-Expose-Headers': 'Content-Type, mcp-session-id, Last-Event-ID',
+            'Access-Control-Max-Age': '86400'
+        },
+        body: ''
+    }
+}
+
+/**
+ * Handle MCP requests using the SDK
+ * Creates fresh server and transport instances per request (stateless pattern).
+* Uses WebStandardStreamableHTTPServerTransport on SDK 1.24+ (Request/Response);
+* falls back to StreamableHTTPServerTransport + mock req/res on SDK 1.17.x.
+*/
+async function handleMcpRequest (params) {
+    const server = createMcpServer(params)
+    const body = parseRequestBody(params)
+
+    try {
+        logger?.info('Creating fresh MCP server and transport')
+
+        const WebStandardTransport = getWebStandardTransport()
+        if (WebStandardTransport) {
+        // SDK 1.24+: use Web Standard transport (no real Node req/res needed)
+        const transport = new WebStandardTransport({
+            sessionIdGenerator: undefined,
+            enableJsonResponse: true
+        })
+        await server.connect(transport)
+        const webRequest = createWebRequest(params)
+        logger?.info('Request method:', body?.method)
+        const requestOptions = body != null ? { parsedBody: body } : {}
+        const response = await transport.handleRequest(webRequest, requestOptions)
+        logger?.info('MCP request processed by SDK (Web Standard transport)')
+        return await responseToRuntime(response)
+        }
+        // SDK 1.17.x: use Node-style transport with mock req/res
+        const req = createCompatibleRequest(params)
+        const res = createCompatibleResponse()
+
+        logger?.info('Request method:', req.body?.method)
+
+        // Create fresh transport for this request
+        const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined, // Stateless - no session tracking
+            enableJsonResponse: true
+        })
+
+        // Connect server to transport
+        await server.connect(transport)
+
+        // Create a promise that resolves when the response is complete
+        const responseComplete = new Promise(resolve => {
+            const originalEnd = res.end.bind(res)
+            res.end = function (chunk) {
+                const result = originalEnd(chunk)
+                setTimeout(() => resolve(), 10)
+                return result
+            }
+        })
+
+        // Let the SDK handle the request
+        await transport.handleRequest(req, res, req.body)
+        await responseComplete
+
+        logger?.info('MCP request processed by SDK')
+        return res.getResult()
+
+    } catch (error) {
+        logger?.error('Error in handleMcpRequest:', error)
+
+        try {
+            server.close()
+        } catch (cleanupError) {
+            logger?.error('Error during cleanup:', cleanupError)
+        }
+
+        return {
+            statusCode: 500,
+            headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                error: {
+                    code: -32603,
+                    message: `Internal server error: ${error.message}`
+                },
+                id: null
+            })
+        }
+    }
+}
+
+/**
+ * Main function for Adobe I/O Runtime
+ */
+async function main (params) {
+    try {
+        console.log('=== MCP SERVER (CLEAN SDK IMPLEMENTATION) ===')
+        console.log('Method:', params.__ow_method)
+
+        // Initialize logger
+        try {
+            logger = aioLogger('prism-mcp-server', { level: params.LOG_LEVEL || 'info' })   
+        } catch (loggerError) {
+            console.error('Logger creation error:', loggerError)
+            return {
+                statusCode: 500,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ error: `Logger creation error: ${loggerError.message}` })
+            }
+        }
+
+        logger.info('MCP Server using @modelcontextprotocol/sdk (Web Standard transport on 1.24+, Node transport on 1.17.x)')
+        logger.info(`Request method: ${params.__ow_method}`)
+
+        // Route requests
+        const incomingHeaders = normalizeHeaders(params.__ow_headers)
+        const requestPath = params.__ow_path || ''
+        
+        switch (params.__ow_method?.toLowerCase()) {
+        case 'get':
+            // Handle OAuth metadata requests - return proper JSON indicating OAuth is not supported
+            if (requestPath.includes('.well-known/oauth') || requestPath.includes('/oauth/') || requestPath.includes('/authorize') || requestPath.includes('/token')) {
+                logger.info('OAuth endpoint requested - returning not supported response')
+                const useIms = String(params.AUTH_VALIDATE_IMS || "").toLowerCase() === "true"
+                const serviceKey = params.SERVICE_API_KEY && String(params.SERVICE_API_KEY).trim()
+                
+                let authMessage = "This MCP server does not support OAuth. "
+                if (useIms) {
+                    authMessage += "IMS token authentication is required. Please configure your MCP client with 'Authorization: Bearer YOUR_IMS_TOKEN' header. See server documentation for configuration examples."
+                } else if (serviceKey) {
+                    authMessage += "API key authentication is required. Please configure your MCP client with 'Authorization: Bearer YOUR_API_KEY' or 'x-api-key: YOUR_API_KEY' header."
+                } else {
+                    authMessage += "No authentication is configured on this server."
+                }
+                
+                return {
+                    statusCode: 200,
+                    headers: {
+                        'Access-Control-Allow-Origin': '*',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        error: "oauth_not_supported",
+                        error_description: authMessage,
+                        oauth_enabled: false
+                    })
+                }
+            }
+            
+            // Check if client is requesting SSE stream
+            // Return empty 200 response to gracefully indicate SSE is not available
+            // This prevents error messages in MCP clients while allowing fallback to HTTP
+            if (incomingHeaders.accept && incomingHeaders.accept.includes('text/event-stream')) {
+                logger.info('SSE stream requested - not supported in serverless, returning graceful response')
+                return {
+                    statusCode: 200,
+                    headers: {
+                        'Access-Control-Allow-Origin': '*',
+                        'Content-Type': 'text/event-stream',
+                        'Cache-Control': 'no-cache',
+                        'Connection': 'close'
+                    },
+                    body: 'event: error\ndata: {"error": "SSE not supported in serverless. Use HTTP transport."}\n\n'
+                }
+            }
+            logger.info('Health check request')
+            return handleHealthCheck()
+
+        case 'options':
+            logger.info('CORS preflight request')
+            return handleOptionsRequest()
+
+        case 'post':
+            logger.info('MCP protocol request - validating authentication')
+            
+            // Validate authentication if configured (only for POST requests)
+            const authResult = await validateRequestAuth(params, logger)
+            if (authResult.error) {
+                logger.warn('Authentication failed:', authResult.error)
+                return {
+                    statusCode: 401,
+                    headers: {
+                        'Access-Control-Allow-Origin': '*',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        jsonrpc: '2.0',
+                        error: {
+                            code: -32001,
+                            message: authResult.error
+                        },
+                        id: null
+                    })
+                }
+            }
+            // Optionally attach userInfo to params for downstream use
+            if (authResult.userInfo) {
+                params.AUTH_USER_INFO = authResult.userInfo
+                logger.info('IMS authentication successful')
+            }
+            
+            logger.info('Authentication passed - delegating to SDK')
+            return await handleMcpRequest(params)
+
+        default:
+            logger.warn(`Method not allowed: ${params.__ow_method}`)
+        return {
+            statusCode: 405,
+            headers: {
+                    'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                error: {
+                        code: -32000,
+                        message: `Method '${params.__ow_method}' not allowed. Supported: GET, POST, OPTIONS`
+                },
+                id: null
+            })
+        }
+        }
+
+    } catch (error) {
+        if (logger) {
+            logger.error('Uncaught error in main function:', error)
+        } else {
+            console.error('Uncaught error in main function:', error)
+        }
+
+        return {
+            statusCode: 500,
+            headers: {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                error: {
+                    code: -32603,
+                    message: `Unhandled server error: ${error.message}`
+                },
+                id: null
+            })
+        }
+    }
+}
+
+// Export for Adobe I/O Runtime
+module.exports = { main }

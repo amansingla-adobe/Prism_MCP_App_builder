@@ -1,0 +1,11 @@
+{
+  "name": "prism-mcp-server-action",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@adobe/aio-lib-core-logging": "^2.0.1",
+    "@modelcontextprotocol/sdk": "^1.24.0",
+    "zod": "^3.23.8",
+    "openwhisk": "^3.21.8"
+  }
+}

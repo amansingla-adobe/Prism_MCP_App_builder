@@ -1,0 +1,54 @@
+# MCP Server Template - Adobe I/O Runtime Application Configuration
+# 
+# This configuration file defines how your MCP server will be deployed to Adobe I/O Runtime.
+# You can customize the settings below to match your specific requirements.
+
+application:
+  actions: actions
+  web: web-src
+  runtimeManifest:
+    packages:
+      # Package name - change this to match your project name
+      prism-mcp-server:
+        license: MIT
+        actions:
+          # Main MCP server action
+          mcp-server:
+            function: actions/mcp-server
+            web: 'yes'
+            runtime: 'nodejs:20'
+            limits:
+              # Timeout in milliseconds (5 minutes for complex operations)
+              timeout: 300000
+              # Memory limit in MB (adjust based on your needs)
+              memory: 512
+              concurrency: 1
+            inputs:
+              # Set log level (debug, info, warn, error)
+              LOG_LEVEL: debug
+              # Authentication: IMS token validation or API key
+              # Set AUTH_VALIDATE_IMS=true to validate Bearer tokens via Adobe IMS
+              # Set SERVICE_API_KEY for simple API key authentication
+              # Leave both unset for no authentication (development only)
+              SERVICE_API_KEY: $SERVICE_API_KEY
+              AUTH_VALIDATE_IMS: $AUTH_VALIDATE_IMS
+              DATABRICKS_SERVER_HOSTNAME: $DATABRICKS_SERVER_HOSTNAME
+              DATABRICKS_HTTP_PATH: $DATABRICKS_HTTP_PATH
+              DATABRICKS_TOKEN: $DATABRICKS_TOKEN
+              DATABRICKS_WAREHOUSE_ID: $DATABRICKS_WAREHOUSE_ID
+            annotations:
+              # No Adobe authentication required for MCP servers
+              require-adobe-auth: false
+              # Final action (no further processing)
+              final: true
+              # Expose as web action
+              web-export: true
+              # Enable raw HTTP mode for MCP protocol
+              raw-http: true
+          demo-slow-job:
+            function: actions/demo-slow-job/index.js
+            runtime: 'nodejs:20'
+            limits:
+              timeout: 120000
+            annotations:
+              final: true

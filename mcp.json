@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "prism-mcp": {
+      "type": "streamable-http",
+      "url": "https://14257-prismmcpserver-stage.adobeioruntime.net/api/v1/web/prism-mcp-server/mcp-server"
+    }
+  }
+}
