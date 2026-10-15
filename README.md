@@ -123,3 +123,5 @@ curl -H "x-api-key: your-secret-key-here" \
 Leave both variables unset for open access (not recommended for production).
 
 **Security Note:** Always use authentication in production deployments. Generate strong random values for `SERVICE_API_KEY` and never commit secrets to version control. 
+# Prism_MCP_App_builder
+This codebase is for the MCP server on the App builder for project Prism
