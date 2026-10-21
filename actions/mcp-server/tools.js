@@ -25,7 +25,6 @@ governing permissions and limitations under the License.
 
 const { z } = require('zod')
 const openwhisk = require('openwhisk')
-const { compute: computeGuardrailQuery } = require('./guardrailQuery')
 /**
  * Register all tools with the MCP server
  * @param {McpServer} server - The MCP server instance
@@ -52,24 +51,25 @@ function registerTools (server, actionParams = {}) {
 
     // Placeholder for a real slow backend call — just sleeps, then returns a canned result
     server.tool(
-        'start_demo_job',
+                'start_demo_job',
         'Starts a placeholder long-running job for testing the async job pattern. Returns a job_id to poll with check_job_status.',
         {
-            durationSeconds: z.number().optional().describe('How long the demo job should take (default 15s)')
+            durationSeconds: z.number().optional().describe('How long the demo job should take (default 15s)'),
+            callerContext: z.string().optional().describe('Optional identifier so only the same caller can retrieve this job\'s result')
         },
-        async ({ durationSeconds = 15 }) => {
-            const ow = openwhisk() // no args needed — picks up this action's own namespace identity automatically
+        async ({ durationSeconds = 15, callerContext }) => {
+            const ow = openwhisk()
             const result = await ow.actions.invoke({
                 name: 'prism-mcp-server/demo-slow-job',
                 blocking: false,
                 result: false,
-                params: { durationSeconds }
+                params: { durationSeconds, callerContext: callerContext ?? null }
             })
             return {
                 content: [
                     {
                         type: 'text',
-                        text: `Job started. job_id=${result.activationId} — call check_job_status with this job_id to get the result.`
+                        text: `Job started. job_id=${result.activationId} — call check_job_status with this job_id${callerContext ? ' and the same callerContext' : ''} to get the result.`
                     }
                 ]
             }
@@ -77,34 +77,63 @@ function registerTools (server, actionParams = {}) {
     )
 
     // Generic poller — reusable for any job started by a start_* tool
-    server.tool(
+        server.tool(
         'check_job_status',
-        'Checks a previously started long-running job by job_id. Reusable for any async job this MCP server starts.',
+        'Checks a previously started long-running job by job_id. Reusable for any async job this MCP server starts. ' +
+        'If the job was started with a callerContext, pass the SAME callerContext here to verify you are polling your own request.',
         {
-            jobId: z.string().describe('The job_id returned by a start_* tool')
+            jobId: z.string().describe('The job_id returned by a start_* tool'),
+            callerContext: z.string().optional().describe('If the start_* tool was called with a callerContext, pass the same value here to verify ownership')
         },
-        async ({ jobId }) => {
+        async ({ jobId, callerContext }) => {
+            if (!/^[a-f0-9]{32}$/.test(jobId)) {
+                return { content: [{ type: 'text', text: 'Invalid job_id format.' }] }
+            }
+
             const ow = openwhisk()
+            let activation
             try {
-                const activation = await ow.activations.get({ name: jobId })
-                if (!activation.response) {
-                    return { content: [{ type: 'text', text: 'Still running, try again shortly.' }] }
-                }
-                return { content: [{ type: 'text', text: JSON.stringify(activation.response.result) }] }
+                activation = await ow.activations.get({ name: jobId })
             } catch (e) {
                 if (e.statusCode === 404) {
                     return { content: [{ type: 'text', text: 'Still running (not found yet), try again shortly.' }] }
                 }
                 throw e
             }
+
+            if (!activation.response) {
+                return { content: [{ type: 'text', text: 'Still running, try again shortly.' }] }
+            }
+
+            const { result, success } = activation.response
+            if (success !== true || (result && result.error)) {
+                const err = result && result.error
+                const message = typeof err === 'string'
+                    ? err
+                    : (err && err.body && typeof err.body.error === 'string')
+                        ? err.body.error
+                        : (err && typeof err.message === 'string')
+                            ? err.message
+                            : 'The job failed to complete successfully.'
+                return { content: [{ type: 'text', text: `Job failed: ${message}` }] }
+            }
+
+            const body = (result && result.body) ? result.body : result
+            if (callerContext !== undefined && (!body || body.callerContext !== callerContext)) {
+                return { content: [{ type: 'text', text: 'This job does not belong to the provided callerContext.' }] }
+            }
+
+            return { content: [{ type: 'text', text: JSON.stringify(body) }] }
         }
     )
+    
         // Real tool #1: guardrail/governance breach status, backed by live Databricks.
     // Returns structured data only (no narration) — narration happens downstream,
     // in whatever client/backend calls this MCP server.
     server.tool(
-        'query_guardrails',
-        'Query guardrail/governance breach status for an AEP sandbox. Flexible — combine parameters as needed. ' +
+        'start_query_guardrails',
+        'Starts a guardrail/governance breach status query for an AEP sandbox. Returns a job_id — call check_job_status with it to get the result. ' +
+        'Flexible — combine parameters as needed. ' +
         'Overall status right now: leave guardrailName and windowDays empty. ' +
         'One specific guardrail: set guardrailName to a single name (e.g. "Streaming Ingestion"). ' +
         'Compare two or more specific guardrails: set guardrailName to a list of exact names. ' +
@@ -119,23 +148,34 @@ function registerTools (server, actionParams = {}) {
             windowDays: z.number().int().optional().describe('Number of days to look back. Omit for a right-now snapshot.'),
             sortBy: z.enum(['pct', 'breach_count']).optional().describe('Ranking basis when windowDays is set (default "pct").'),
             topN: z.number().int().optional().describe('Limit for ranked/worst-offender questions.'),
-            compareToDaysAgo: z.number().int().optional().describe('Set to answer "what is newly breaching vs N days ago" — overrides guardrailName/windowDays.')
-        },
-        async ({ sandbox, guardrailName, windowDays, sortBy, topN, compareToDaysAgo }) => {
-            const credentials = {
-                host: actionParams.DATABRICKS_SERVER_HOSTNAME,
-                warehouseId: actionParams.DATABRICKS_WAREHOUSE_ID,
-                token: actionParams.DATABRICKS_TOKEN
-            }
-            const result = await computeGuardrailQuery(credentials, {
-                sandbox,
-                guardrailName: guardrailName ?? null,
-                windowDays: windowDays ?? null,
-                sortBy: sortBy ?? 'pct',
-                topN: topN ?? null,
-                compareToDaysAgo: compareToDaysAgo ?? null
+            compareToDaysAgo: z.number().int().optional().describe('Set to answer "what is newly breaching vs N days ago" — overrides guardrailName/windowDays.'),
+            callerContext: z.string().optional().describe('Optional identifier (e.g. user+sandbox) so only the same caller can retrieve this job\'s result via check_job_status')
+        },   
+        
+        async ({ sandbox, guardrailName, windowDays, sortBy, topN, compareToDaysAgo, callerContext }) => {
+            const ow = openwhisk()
+            const result = await ow.actions.invoke({
+                name: 'prism-mcp-server/guardrail-worker',
+                blocking: false,
+                result: false,
+                params: {
+                    sandbox,
+                    guardrailName: guardrailName ?? null,
+                    windowDays: windowDays ?? null,
+                    sortBy: sortBy ?? 'pct',
+                    topN: topN ?? null,
+                    compareToDaysAgo: compareToDaysAgo ?? null,
+                    callerContext: callerContext ?? null
+                }
             })
-            return { content: [{ type: 'text', text: JSON.stringify(result) }] }
+            return {
+                content: [
+                    {
+                        type: 'text',
+                        text: `Job started. job_id=${result.activationId} — call check_job_status with this job_id${callerContext ? ' and the same callerContext' : ''} to get the result.`
+                    }
+                ]
+            }
         }
     )
     // Example calculation tool

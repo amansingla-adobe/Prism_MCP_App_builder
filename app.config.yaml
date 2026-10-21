@@ -32,10 +32,6 @@ application:
               # Leave both unset for no authentication (development only)
               SERVICE_API_KEY: $SERVICE_API_KEY
               AUTH_VALIDATE_IMS: $AUTH_VALIDATE_IMS
-              DATABRICKS_SERVER_HOSTNAME: $DATABRICKS_SERVER_HOSTNAME
-              DATABRICKS_HTTP_PATH: $DATABRICKS_HTTP_PATH
-              DATABRICKS_TOKEN: $DATABRICKS_TOKEN
-              DATABRICKS_WAREHOUSE_ID: $DATABRICKS_WAREHOUSE_ID
             annotations:
               # No Adobe authentication required for MCP servers
               require-adobe-auth: false
@@ -50,5 +46,19 @@ application:
             runtime: 'nodejs:20'
             limits:
               timeout: 120000
+            annotations:
+              final: true
+          
+          
+          guardrail-worker:
+            function: actions/guardrail-worker/index.js
+            runtime: 'nodejs:20'
+            limits:
+              timeout: 180000
+            inputs:
+              DATABRICKS_SERVER_HOSTNAME: $DATABRICKS_SERVER_HOSTNAME
+              DATABRICKS_HTTP_PATH: $DATABRICKS_HTTP_PATH
+              DATABRICKS_TOKEN: $DATABRICKS_TOKEN
+              DATABRICKS_WAREHOUSE_ID: $DATABRICKS_WAREHOUSE_ID
             annotations:
               final: true
