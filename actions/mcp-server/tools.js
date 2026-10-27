@@ -126,7 +126,7 @@ function registerTools (server, actionParams = {}) {
             return { content: [{ type: 'text', text: JSON.stringify(body) }] }
         }
     )
-    
+
         // Real tool #1: guardrail/governance breach status, backed by live Databricks.
     // Returns structured data only (no narration) — narration happens downstream,
     // in whatever client/backend calls this MCP server.
@@ -178,7 +178,119 @@ function registerTools (server, actionParams = {}) {
             }
         }
     )
-    // Example calculation tool
+    // Real tool #2: segmentation job execution status/duration/reliability, backed by live Databricks.
+    server.tool(
+        'start_query_segment_jobs',
+        'Starts a query for AEP segmentation job execution status, duration, and reliability. Returns a job_id — call check_job_status with it to get the result. ' +
+        'A specific job\'s status/duration: set jobId. ' +
+        'Which job(s) ran on a specific day: set jobDate (YYYY-MM-DD) — honestly reports a fallback date if that day has not synced yet. ' +
+        'Reliability/performance over a period: set windowDays (e.g. 7). ' +
+        'Filter to one outcome: set status (SUCCEEDED/FAILED/CANCELLED/CANCELLING/PROCESSING/QUEUED/NEW). ' +
+        'Filter to still-running or cancelled jobs: set statusGroup to "in_flight" or "cancelled". ' +
+        'Filter to scheduled vs manual runs: set source to "scheduler" or "api". ' +
+        'Ranking: combine windowDays with topN and sortBy ("duration" or "profiles"). ' +
+        'Trend/comparison views: set groupBy to "day", "source", "schedule", or "sandbox" (compares ALL sandboxes). ' +
+        'This vs previous period: set comparePreviousPeriod true alongside windowDays.',
+        {
+            sandbox: z.string().describe('Which AEP sandbox, e.g. "xlg-prod". Ignored when groupBy is "sandbox".'),
+            jobId: z.string().optional().describe('An exact job ID, if the user gives one directly.'),
+            jobDate: z.string().optional().describe('A specific calendar date (YYYY-MM-DD) to check which job(s) ran.'),
+            status: z.enum(['SUCCEEDED', 'FAILED', 'CANCELLED', 'CANCELLING', 'PROCESSING', 'QUEUED', 'NEW']).optional()
+                .describe('Filter to one exact status.'),
+            statusGroup: z.enum(['in_flight', 'cancelled']).optional()
+                .describe('"in_flight" for still-running jobs, "cancelled" for cancelled jobs.'),
+            windowDays: z.number().int().optional().describe('Number of days to look back for reliability/trend questions.'),
+            source: z.enum(['scheduler', 'api']).optional().describe('Filter to scheduled vs manual/API-triggered runs.'),
+            sortBy: z.enum(['duration', 'profiles']).optional().describe('Ranking basis (default "duration").'),
+            topN: z.number().int().optional().describe('Limit for ranked questions.'),
+            groupBy: z.enum(['day', 'source', 'schedule', 'sandbox']).optional()
+                .describe('Produces a grouped breakdown instead of a flat job list. Requires windowDays (defaults to 7).'),
+            comparePreviousPeriod: z.boolean().optional()
+                .describe('Compare the current windowDays-long period against the immediately preceding one of equal length.'),
+            callerContext: z.string().optional().describe('Optional identifier (e.g. user+sandbox) so only the same caller can retrieve this job\'s result via check_job_status')
+        },
+        async ({ sandbox, jobId, jobDate, status, statusGroup, windowDays, source, sortBy, topN, groupBy, comparePreviousPeriod, callerContext }) => {
+            const ow = openwhisk()
+            const result = await ow.actions.invoke({
+                name: 'prism-mcp-server/segment-job-worker',
+                blocking: false,
+                result: false,
+                params: {
+                    sandbox,
+                    jobId: jobId ?? null,
+                    jobDate: jobDate ?? null,
+                    status: status ?? null,
+                    statusGroup: statusGroup ?? null,
+                    windowDays: windowDays ?? null,
+                    source: source ?? null,
+                    sortBy: sortBy ?? 'duration',
+                    topN: topN ?? null,
+                    groupBy: groupBy ?? null,
+                    comparePreviousPeriod: comparePreviousPeriod ?? false,
+                    callerContext: callerContext ?? null
+                }
+            })
+            return {
+                content: [
+                    {
+                        type: 'text',
+                        text: `Job started. job_id=${result.activationId} — call check_job_status with this job_id${callerContext ? ' and the same callerContext' : ''} to get the result.`
+                    }
+                ]
+            }
+        }
+    )
+    // Real tool #3: audiences inside a segmentation job, backed by live Databricks.
+    server.tool(
+        'start_query_segment_audiences',
+        'Starts a query for audiences/segments inside AEP segmentation job(s). Returns a job_id — call check_job_status with it to get the result. ' +
+        'All audiences in one job: set jobId. ' +
+        'All audiences across whatever job(s) ran on a day: set jobDate (YYYY-MM-DD) — honestly reports a fallback date if that day has not synced yet. ' +
+        'Neither jobId nor jobDate: defaults to the latest available day. ' +
+        'One audience\'s history over time (e.g. "has this audience ever crossed 30%?"): set audienceId or segmentName, plus windowDays. ' +
+        'segmentName is matched case-insensitively; if it matches more than one distinct audience, all are returned separately. ' +
+        'Which audience is consistently highest / most often empty: set windowDays alone (no jobId/jobDate/audienceId/segmentName) — ranks ALL audiences. ' +
+        'threshold_pct defaults to 30 — set it to use a different cutoff for "above X%" questions. ' +
+        'topN limits how many audiences/results come back.',
+        {
+            sandbox: z.string().describe('Which AEP sandbox, e.g. "xlg-prod"'),
+            jobId: z.string().optional().describe('An exact segmentation job ID — returns every audience inside it.'),
+            jobDate: z.string().optional().describe('A specific calendar date (YYYY-MM-DD) to check audiences for whatever job(s) ran that day.'),
+            audienceId: z.string().optional().describe('An exact audience/segment ID to trace across windowDays.'),
+            segmentName: z.string().optional().describe('A segment name (case-insensitive) to trace across windowDays — resolved to its ID(s) first.'),
+            windowDays: z.number().int().optional().describe('Number of days to look back. Required with audienceId/segmentName; alone, ranks all audiences.'),
+            thresholdPct: z.number().optional().describe('Percent-of-total-profiles cutoff for "above threshold" flagging. Default 30.'),
+            topN: z.number().int().optional().describe('Limit for ranked/list outputs.'),
+            callerContext: z.string().optional().describe('Optional identifier (e.g. user+sandbox) so only the same caller can retrieve this job\'s result via check_job_status')
+        },
+        async ({ sandbox, jobId, jobDate, audienceId, segmentName, windowDays, thresholdPct, topN, callerContext }) => {
+            const ow = openwhisk()
+            const result = await ow.actions.invoke({
+                name: 'prism-mcp-server/segment-audience-worker',
+                blocking: false,
+                result: false,
+                params: {
+                    sandbox,
+                    jobId: jobId ?? null,
+                    jobDate: jobDate ?? null,
+                    audienceId: audienceId ?? null,
+                    segmentName: segmentName ?? null,
+                    windowDays: windowDays ?? null,
+                    thresholdPct: thresholdPct ?? 30.0,
+                    topN: topN ?? null,
+                    callerContext: callerContext ?? null
+                }
+            })
+            return {
+                content: [
+                    {
+                        type: 'text',
+                        text: `Job started. job_id=${result.activationId} — call check_job_status with this job_id${callerContext ? ' and the same callerContext' : ''} to get the result.`
+                    }
+                ]
+            }
+        }
+    )
     server.tool(
         'calculator',
         'Perform basic mathematical calculations. Supports arithmetic operations and common mathematical functions.',

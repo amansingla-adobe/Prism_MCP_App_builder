@@ -62,3 +62,30 @@ application:
               DATABRICKS_WAREHOUSE_ID: $DATABRICKS_WAREHOUSE_ID
             annotations:
               final: true
+
+                  
+          segment-job-worker:
+            function: actions/segment-job-worker/index.js
+            runtime: 'nodejs:20'
+            limits:
+              timeout: 180000
+            inputs:
+              DATABRICKS_SERVER_HOSTNAME: $DATABRICKS_SERVER_HOSTNAME
+              DATABRICKS_HTTP_PATH: $DATABRICKS_HTTP_PATH
+              DATABRICKS_TOKEN: $DATABRICKS_TOKEN
+              DATABRICKS_WAREHOUSE_ID: $DATABRICKS_WAREHOUSE_ID
+            annotations:
+              final: true
+
+          segment-audience-worker:
+            function: actions/segment-audience-worker/index.js
+            runtime: 'nodejs:20'
+            limits:
+              timeout: 180000
+            inputs:
+              DATABRICKS_SERVER_HOSTNAME: $DATABRICKS_SERVER_HOSTNAME
+              DATABRICKS_HTTP_PATH: $DATABRICKS_HTTP_PATH
+              DATABRICKS_TOKEN: $DATABRICKS_TOKEN
+              DATABRICKS_WAREHOUSE_ID: $DATABRICKS_WAREHOUSE_ID
+            annotations:
+              final: true
