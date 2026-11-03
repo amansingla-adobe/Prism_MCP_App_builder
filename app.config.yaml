@@ -89,3 +89,12 @@ application:
               DATABRICKS_WAREHOUSE_ID: $DATABRICKS_WAREHOUSE_ID
             annotations:
               final: true
+          
+          
+          chunk-holder:
+            function: actions/chunk-holder/index.js
+            runtime: 'nodejs:20'
+            limits:
+              timeout: 60000
+            annotations:
+              final: true

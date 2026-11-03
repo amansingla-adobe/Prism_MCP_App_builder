@@ -39,6 +39,7 @@ const AUDIENCE_TABLE = 'dpaas_uccatalog_prd.aoaitgot.aep_segment_job_audiences'
 const SEGMENT_TABLE = 'dpaas_uccatalog_prd.aoaitgot.aep_segment'
 
 const DEFAULT_THRESHOLD_PCT = 30.0
+const DEFAULT_TOP_N = 50
 
 function assertSafeIntervalDays (value, label) {
     const n = Number(value)
@@ -227,7 +228,7 @@ async function enrichWithSegmentInfo (credentials, sandbox, audienceRows) {
  */
 async function compute (credentials, {
     sandbox, jobId = null, jobDate = null, audienceId = null, segmentName = null,
-    windowDays = null, thresholdPct = DEFAULT_THRESHOLD_PCT, topN = null
+    windowDays = null, thresholdPct = DEFAULT_THRESHOLD_PCT, topN = null, aboveThresholdOnly = false
 }) {
     // --- Path 1: one specific job ---
     if (jobId) {
@@ -242,13 +243,21 @@ async function compute (credentials, {
         audiences.forEach(a => { a.above_threshold = a.pct_of_total_profiles !== null && a.pct_of_total_profiles > thresholdPct })
         const above = audiences.filter(a => a.above_threshold)
         const empty = audiences.filter(a => a.is_empty)
+        const outputPool = aboveThresholdOnly
+            ? [...above].sort((a, b) => (b.pct_of_total_profiles ?? -Infinity) - (a.pct_of_total_profiles ?? -Infinity))
+            : audiences
+        const effectiveTopN = topN ?? DEFAULT_TOP_N
+        const outputAudiences = outputPool.slice(0, effectiveTopN)
         return {
             sandbox, job_id: jobId, job_date: String(audRows[0].job_date),
             job_status: audRows[0].job_status,
             total_profiles: audRows[0].totalProfiles === null || audRows[0].totalProfiles === undefined ? null : Math.trunc(Number(audRows[0].totalProfiles)),
             found: true, threshold_pct: thresholdPct,
             audience_count: audiences.length, above_threshold_count: above.length, empty_count: empty.length,
-            audiences: topN ? audiences.slice(0, topN) : audiences
+            audiences: outputAudiences,
+            message: outputPool.length > outputAudiences.length
+                ? `Showing ${outputAudiences.length} of ${outputPool.length} matching audiences - full list too large to display at once. Ask for a specific topN to see more, up to ${outputPool.length}.`
+                : null
         }
     }
 
@@ -282,7 +291,7 @@ async function compute (credentials, {
         const audiences = audRows.length ? await enrichWithSegmentInfo(credentials, sandbox, audRows) : []
         audiences.forEach(a => { a.above_threshold = a.pct_of_total_profiles !== null && a.pct_of_total_profiles > thresholdPct })
 
-        const jobsOut = jobIds.map(jid => {
+                const jobsOut = jobIds.map(jid => {
             const idsForJob = new Set(audRows.filter(r => r.jobId === jid).map(r => r.audienceId))
             const jobAudiences = audiences.filter(a => idsForJob.has(a.audience_id))
             return {
@@ -290,15 +299,38 @@ async function compute (credentials, {
                 audience_count: jobAudiences.length,
                 above_threshold_count: jobAudiences.filter(a => a.above_threshold).length,
                 empty_count: jobAudiences.filter(a => a.is_empty).length,
-                audiences: topN ? jobAudiences.slice(0, topN) : jobAudiences
+                jobAudiences
             }
         })
+
+        // Flattened, tagged with job_id - this is the field our chunking logic
+        // protects (same safe per-item granularity already proven at 705/3154
+        // items). `jobs` stays a small summary-only array (no nested audiences),
+        // so it never risks the 1MB ceiling regardless of audience volume.
+        // Filtering/sorting/topN all happen GLOBALLY here, after flattening -
+        // not per-job - so topN means "top N overall", not "top N per job".
+        const allFlatAudiences = jobsOut.flatMap(j => j.jobAudiences.map(a => ({ ...a, job_id: j.job_id })))
+        const filteredAudiences = aboveThresholdOnly ? allFlatAudiences.filter(a => a.above_threshold) : allFlatAudiences
+        const sortedAudiences = aboveThresholdOnly
+            ? [...filteredAudiences].sort((a, b) => (b.pct_of_total_profiles ?? -Infinity) - (a.pct_of_total_profiles ?? -Infinity))
+            : filteredAudiences
+        const effectiveTopN = topN ?? DEFAULT_TOP_N
+        const flatAudiences = sortedAudiences.slice(0, effectiveTopN)
+        const jobsSummary = jobsOut.map(({ jobAudiences, ...rest }) => rest)
+        const truncationMessage = sortedAudiences.length > flatAudiences.length
+            ? `Showing ${flatAudiences.length} of ${sortedAudiences.length} matching audiences - full list too large to display at once. Ask for a specific topN to see more, up to ${sortedAudiences.length}.`
+            : null
 
         return {
             sandbox, requested_date: jobDate, data_as_of: String(dataAsOf),
             target_date: targetDate, fallback_used: fallbackUsed, found: true,
-            threshold_pct: thresholdPct, job_count: jobIds.length, jobs: jobsOut,
-            message: fallbackUsed ? `No job data has synced yet for ${jobDate} - showing ${dataAsOf} instead.` : null
+            threshold_pct: thresholdPct, job_count: jobIds.length, jobs: jobsSummary,
+            above_threshold_count: allFlatAudiences.filter(a => a.above_threshold).length,
+            audiences: flatAudiences,
+            message: [
+                fallbackUsed ? `No job data has synced yet for ${jobDate} - showing ${dataAsOf} instead.` : null,
+                truncationMessage
+            ].filter(Boolean).join(' ') || null
         }
     }
 
@@ -359,10 +391,15 @@ async function compute (credentials, {
         max_pct_of_total_profiles: r.max_pct === null || r.max_pct === undefined ? null : Math.round(Number(r.max_pct) * 100) / 100,
         empty_count: Math.trunc(Number(r.empty_count))
     }))
+    const effectiveTopN = topN ?? DEFAULT_TOP_N
+    const rankedOutput = ranked.slice(0, effectiveTopN)
     return {
         sandbox, window_days: windowDays, threshold_pct: thresholdPct,
         found: true, audience_count: ranked.length,
-        audiences: topN ? ranked.slice(0, topN) : ranked
+        audiences: rankedOutput,
+        message: ranked.length > rankedOutput.length
+            ? `Showing ${rankedOutput.length} of ${ranked.length} audiences - full list too large to display at once. Ask for a specific topN to see more, up to ${ranked.length}.`
+            : null
     }
 }
 

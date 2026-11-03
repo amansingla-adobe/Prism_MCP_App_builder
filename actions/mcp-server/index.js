@@ -453,7 +453,7 @@ async function main (params) {
         switch (params.__ow_method?.toLowerCase()) {
         case 'get':
             // Handle OAuth metadata requests - return proper JSON indicating OAuth is not supported
-            if (requestPath.includes('.well-known/oauth') || requestPath.includes('/oauth/') || requestPath.includes('/authorize') || requestPath.includes('/token')) {
+                if (requestPath.includes('.well-known/oauth') || requestPath.includes('/oauth/') || requestPath.includes('/authorize') || requestPath.includes('/token') || requestPath.includes('/register')) {
                 logger.info('OAuth endpoint requested - returning not supported response')
                 const useIms = String(params.AUTH_VALIDATE_IMS || "").toLowerCase() === "true"
                 const serviceKey = params.SERVICE_API_KEY && String(params.SERVICE_API_KEY).trim()

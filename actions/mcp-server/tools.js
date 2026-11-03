@@ -83,9 +83,10 @@ function registerTools (server, actionParams = {}) {
         'If the job was started with a callerContext, pass the SAME callerContext here to verify you are polling your own request.',
         {
             jobId: z.string().describe('The job_id returned by a start_* tool'),
-            callerContext: z.string().optional().describe('If the start_* tool was called with a callerContext, pass the same value here to verify ownership')
+            callerContext: z.string().optional().describe('If the start_* tool was called with a callerContext, pass the same value here to verify ownership'),
+            chunkIndex: z.number().int().optional().describe('For a paginated result, which chunk to fetch (0-based). Omit on the first call to get the summary + chunk count.')
         },
-        async ({ jobId, callerContext }) => {
+        async ({ jobId, callerContext, chunkIndex }) => {
             if (!/^[a-f0-9]{32}$/.test(jobId)) {
                 return { content: [{ type: 'text', text: 'Invalid job_id format.' }] }
             }
@@ -118,14 +119,40 @@ function registerTools (server, actionParams = {}) {
                 return { content: [{ type: 'text', text: `Job failed: ${message}` }] }
             }
 
-            const body = (result && result.body) ? result.body : result
+                        const body = (result && result.body) ? result.body : result
             if (callerContext !== undefined && (!body || body.callerContext !== callerContext)) {
                 return { content: [{ type: 'text', text: 'This job does not belong to the provided callerContext.' }] }
+            }
+
+                       if (body && body.paginated === true) {
+                const { chunkJobIds, chunkedField, paginated, totalItems, ...rest } = body
+                if (chunkIndex === undefined) {
+                    // First call: just hand back pointers + summary, nothing bulky.
+                    return { content: [{ type: 'text', text: JSON.stringify({ ...rest, paginated: true, chunkedField, totalItems, chunkCount: chunkJobIds.length }) }] }
+                }
+                if (chunkIndex < 0 || chunkIndex >= chunkJobIds.length) {
+                    return { content: [{ type: 'text', text: `Invalid chunkIndex. Valid range: 0-${chunkJobIds.length - 1}.` }] }
+                }
+                let chunkActivation
+                try {
+                    chunkActivation = await ow.activations.get({ name: chunkJobIds[chunkIndex] })
+                } catch (e) {
+                    if (e.statusCode === 404) return { content: [{ type: 'text', text: 'Still running, try again shortly.' }] }
+                    throw e
+                }
+                if (!chunkActivation.response || chunkActivation.response.success !== true) {
+                    return { content: [{ type: 'text', text: 'Still running, try again shortly.' }] }
+                }
+                                return { content: [{ type: 'text', text: JSON.stringify(chunkActivation.response.result.body.chunk) }] }
             }
 
             return { content: [{ type: 'text', text: JSON.stringify(body) }] }
         }
     )
+
+        // Real tool #1: guardrail/governance breach status, backed by live Databricks.
+
+        // Real tool #1: guardrail/governance breach status, backed by live Databricks.
 
         // Real tool #1: guardrail/governance breach status, backed by live Databricks.
     // Returns structured data only (no narration) — narration happens downstream,
@@ -251,7 +278,8 @@ function registerTools (server, actionParams = {}) {
         'segmentName is matched case-insensitively; if it matches more than one distinct audience, all are returned separately. ' +
         'Which audience is consistently highest / most often empty: set windowDays alone (no jobId/jobDate/audienceId/segmentName) — ranks ALL audiences. ' +
         'threshold_pct defaults to 30 — set it to use a different cutoff for "above X%" questions. ' +
-        'topN limits how many audiences/results come back.',
+        'aboveThresholdOnly: set true for "which audiences passed/crossed the threshold" questions - filters to only above-threshold audiences, sorted by percentage descending, BEFORE topN is applied (so topN gives the true top N, not an arbitrary slice). Applies when using jobId, or jobDate/default-latest-day. ' +
+        'topN limits how many audiences/results come back (defaults to 50 if not set, to keep answers readable and within size limits).',
         {
             sandbox: z.string().describe('Which AEP sandbox, e.g. "xlg-prod"'),
             jobId: z.string().optional().describe('An exact segmentation job ID — returns every audience inside it.'),
@@ -260,10 +288,11 @@ function registerTools (server, actionParams = {}) {
             segmentName: z.string().optional().describe('A segment name (case-insensitive) to trace across windowDays — resolved to its ID(s) first.'),
             windowDays: z.number().int().optional().describe('Number of days to look back. Required with audienceId/segmentName; alone, ranks all audiences.'),
             thresholdPct: z.number().optional().describe('Percent-of-total-profiles cutoff for "above threshold" flagging. Default 30.'),
+            aboveThresholdOnly: z.boolean().optional().describe('Set true to filter results to only audiences that passed thresholdPct, sorted highest-percentage-first. Use for "which audiences passed/crossed the threshold" questions.'),
             topN: z.number().int().optional().describe('Limit for ranked/list outputs.'),
             callerContext: z.string().optional().describe('Optional identifier (e.g. user+sandbox) so only the same caller can retrieve this job\'s result via check_job_status')
         },
-        async ({ sandbox, jobId, jobDate, audienceId, segmentName, windowDays, thresholdPct, topN, callerContext }) => {
+        async ({ sandbox, jobId, jobDate, audienceId, segmentName, windowDays, thresholdPct, aboveThresholdOnly, topN, callerContext }) => {
             const ow = openwhisk()
             const result = await ow.actions.invoke({
                 name: 'prism-mcp-server/segment-audience-worker',
@@ -277,6 +306,7 @@ function registerTools (server, actionParams = {}) {
                     segmentName: segmentName ?? null,
                     windowDays: windowDays ?? null,
                     thresholdPct: thresholdPct ?? 30.0,
+                    aboveThresholdOnly: aboveThresholdOnly ?? false,
                     topN: topN ?? null,
                     callerContext: callerContext ?? null
                 }
